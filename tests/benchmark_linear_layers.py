@@ -36,7 +36,7 @@ def torch_wave(x, alpha=1.0):
     alpha_t = torch.tensor(alpha, device=x.device, dtype=x.dtype)
     # Ensure exp_one_t has the same dtype as x to avoid potential dtype mismatches
     exp_one_t = torch.exp(torch.tensor(1.0, device=x.device, dtype=x.dtype))
-    return (alpha_t * x * exp_one_t) / (torch.exp(-x) + torch.exp(x) + 1e-8) # Epsilon for stability
+    return (alpha_t * x * exp_one_t) / (torch.exp(-x) + torch.exp(x))
 
 def torch_pulse(x, alpha=1.0):
     alpha_t = torch.tensor(alpha, device=x.device, dtype=x.dtype)

@@ -164,21 +164,40 @@ def calculate_wt_fc_cuda(wts, inp, w, b, act, device=None):
     p_sums_safe = torch.where(p_sums == 0, torch.ones_like(p_sums), p_sums)
     n_sums_safe = torch.where(n_sums == 0, torch.ones_like(n_sums), n_sums)
     
-    # Custom CUDA kernel for the loop operation
-    for i in range(mul_mat.shape[0]):
-        # Calculate weights for positive components
-        pos_mask = pos_indices[i]
-        pos_vals = mul_mat[i, pos_mask]
-        if pos_mask.any():
-            wt_mat[i, pos_mask] = (pos_vals / p_sums_safe[i]) * wts[i] * p_agg_wts[i]
-        
-        # Calculate weights for negative components
-        neg_mask = neg_indices[i]
-        neg_vals = mul_mat[i, neg_mask]
-        if neg_mask.any():
-            wt_mat[i, neg_mask] = (neg_vals / n_sums_safe[i]) * wts[i] * n_agg_wts[i] * -1.0
+    # Vectorized calculation of wt_mat
+    # Initialize wt_mat with zeros
+    wt_mat = torch.zeros_like(mul_mat)
+
+    # Calculate scaling factors for all rows at once
+    # Ensure that division by zero is handled by p_sums_safe and n_sums_safe
+    # (they have 1s where original sums were 0)
+    pos_scales = (wts * p_agg_wts) / p_sums_safe 
+    neg_scales = (wts * n_agg_wts * -1.0) / n_sums_safe
+
+    # Unsqueeze scales to enable broadcasting with mul_mat: (out_features, 1)
+    # This applies each row's scale to all elements in that row of mul_mat.
+    # These are potential contributions before masking.
+    potential_pos_contrib = mul_mat * pos_scales.unsqueeze(1)
+    potential_neg_contrib = mul_mat * neg_scales.unsqueeze(1)
+
+    # Assign contributions to wt_mat only where the original indices were positive/negative
+    # pos_indices and neg_indices are boolean masks of shape (out_features, in_features)
+    if pos_indices.any(): # Check if there are any positive contributions to avoid operating on empty selections
+        wt_mat[pos_indices] = potential_pos_contrib[pos_indices]
     
-    # Sum across rows to get final weighted matrix
-    result = torch.sum(wt_mat, dim=0)
+    if neg_indices.any(): # Check if there are any negative contributions
+        wt_mat[neg_indices] = potential_neg_contrib[neg_indices]
+    
+    # Sum across rows (dim=0 was original, but mul_mat is (out_features, in_features), so sum along in_features which is dim=1 after transpose)
+    # The original code summed wt_mat along axis 0. wt_mat here is (out_features, in_features).
+    # The einsum in numpy was "ij,i->ji", giving mul_mat as (in_features, out_features) if w was (in,out)
+    # Let's re-verify dimensions.
+    # Original numpy: w_np (in, out), inp (in), mul_mat = einsum("ij,i->ji", w_np, inp) -> (out, in)
+    # mul_mat here is (out_features, in_features)
+    # wts is (out_features)
+    # The final loop in numpy sums wt_mat (out_features, in_features) along axis=0 to get (in_features,)
+    # So, if wt_mat is (out_features, in_features), we should sum along dim=0. 
+
+    result = torch.sum(wt_mat, dim=0) # Sum over output features to get relevance for input features
     
     return result
