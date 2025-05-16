@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from main.pytorch_backtrace.logic.utils import contrast as UC
-from main.pytorch_backtrace.logic.utils.layer_refactors import vgg_layers as UP_REFACTORED
+from main.pytorch_backtrace.logic.utils.layer_refactors import V2_vgg_layers as UP_REFACTORED
 from main.pytorch_backtrace.logic.utils import prop as UP_ORIGINAL
 from main.pytorch_backtrace.logic.config import activation_master
 from main.pytorch_backtrace.logic.utils import helper as HP
@@ -353,7 +353,19 @@ class Backtrace(object):
         activation_dict = self.activation_dict
         out_layer = model_resource[2][0]
         all_wt = {}
+        layer_stack = self.layer_stack # Defined once
 
+        # Determine device from model parameters
+        device = torch.device("cpu") # Default to CPU
+        # Check if self.model exists and has parameters
+        if hasattr(self, 'model') and self.model is not None and hasattr(self.model, 'parameters'):
+            try:
+                params = list(self.model.parameters())
+                if params:
+                    device = params[0].device
+            except StopIteration: # Should not happen with list()
+                pass
+        
         ActiveUP = UP_REFACTORED if use_refactored_handlers else UP_ORIGINAL
 
         if len(start_wt) == 0:
@@ -365,211 +377,174 @@ class Backtrace(object):
                 all_wt[out_layer] = _start_wt_np * multiplier
             else:
                 _start_wt_np = UP_ORIGINAL.calculate_start_wt(all_out[out_layer], scaler, thresholding, task=task)
-                all_wt[out_layer] = _start_wt_np * multiplier
+                _start_wt_intermediate = _start_wt_np * multiplier
             
-                layer_stack = self.layer_stack
-            if self.model_type in ['encoder', 'encoder_decoder']:
-                all_wts = self.model_weights
+            if use_refactored_handlers:
+                all_wt[out_layer] = torch.as_tensor(_start_wt_intermediate, device=device, dtype=torch.float32)
             else:
-                all_wts = None
+                all_wt[out_layer] = _start_wt_intermediate
+        else: # start_wt is provided
+            if use_refactored_handlers:
+                if isinstance(start_wt, np.ndarray):
+                    all_wt[out_layer] = torch.as_tensor(start_wt, device=device, dtype=torch.float32)
+                elif isinstance(start_wt, torch.Tensor):
+                    all_wt[out_layer] = start_wt.to(device=device, dtype=torch.float32)
+                else: # Assuming list or other compatible type
+                    all_wt[out_layer] = torch.tensor(start_wt, device=device, dtype=torch.float32)
+            else: # Original path
+                all_wt[out_layer] = np.array(start_wt) if not isinstance(start_wt, np.ndarray) else start_wt
+
+        # all_wts variable for model weights, seems unused in the loop below, can be removed if not needed.
+        # if self.model_type in ['encoder', 'encoder_decoder']:
+        #     model_actual_weights = self.model_weights
+        # else:
+        #     model_actual_weights = None
                 
         for start_layer in tqdm(layer_stack):
-            if model_resource[1][start_layer]["child"]:
+            # Ensure child_nodes key exists before trying to access it
+            if model_resource[1].get(start_layer, {}).get("child"):
                 child_nodes = model_resource[1][start_layer]["child"]
                 for ch in child_nodes:
                     if ch not in all_wt:
-                        if model_resource[1][start_layer]["class"] == 'LSTM':
-                            if isinstance(all_out[ch], tuple):
-                                all_wt[ch] = np.zeros_like(all_out[ch][0])
+                        target_shape = all_out[ch][0].shape if isinstance(all_out[ch], tuple) else all_out[ch].shape
+                        dtype_for_zeros = torch.float32 if use_refactored_handlers else np.float32
+                        if use_refactored_handlers:
+                            all_wt[ch] = torch.zeros(target_shape, device=device, dtype=dtype_for_zeros)
                         else:
-                                all_wt[ch] = np.zeros_like(all_out[ch])
-                    else:
-                        if isinstance(all_out[ch], tuple):
-                            all_wt[ch] = np.zeros_like(all_out[ch][0])
-                        else:
-                            all_wt[ch] = np.zeros_like(all_out[ch])
+                            all_wt[ch] = np.zeros(target_shape, dtype=dtype_for_zeros)
 
                 module_obj = model_resource[0][start_layer]
                 layer_name_for_activation = model_resource[1][start_layer]["name"]
                 activation_conf = activation_dict.get(layer_name_for_activation, activation_master.get("None"))
 
-                current_relevance_np = all_wt[start_layer] 
+                current_relevance = all_wt[start_layer]
                 
-                input_activation_np = None
-                if child_nodes:
-                    input_activation_np = all_out[child_nodes[0]]
-
-                if model_resource[1][start_layer]["class"] == "Linear":
-                    weights_t = module_obj.weight
-                    bias_t = module_obj.bias
-                    
-                    if use_refactored_handlers:
-                        temp_wt = ActiveUP.calculate_fc_input_relevance_pytorch_cuda(
-                            current_relevance_np,
-                            input_activation_np,
-                            weights_t,
-                            bias_t,
-                            activation_conf
-                        )
-                    else:
-                         temp_wt = ActiveUP.calculate_wt_fc(
-                            current_relevance_np,
-                            input_activation_np,
-                            weights_t,
-                            bias_t,
-                            activation_conf
-                        )
-                    if use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        temp_wt = temp_wt.cpu().detach().numpy()
-                    all_wt[child_nodes[0]] += temp_wt
-
-                elif model_resource[1][start_layer]["class"] == "Conv2d":
-                    weights_t = module_obj.weight
-                    bias_t = module_obj.bias
-                    padding_val = module_obj.padding
-                    stride_val = module_obj.stride
-                    
-                    if use_refactored_handlers:
-                        # Ensure stride_val and padding_val are in correct format for CUDA function
-                        if isinstance(stride_val, int):
-                            stride_val_tuple = (stride_val, stride_val)
-                        else:
-                            stride_val_tuple = stride_val # Should be (sH, sW)
-                        
-                        # padding_val can be int, tuple, or string 'same'/'valid'
-                        # calculate_padding_pytorch_cuda handles these types.
-                        padding_config_for_cuda = padding_val
-
-                        # Prepare inputs as NumPy arrays first for consistent transposition logic
-                        np_input_act_hwc = np.transpose(input_activation_np.squeeze(0), (1, 2, 0)) # InH, InW, InC
-                        np_kernel_khw_inc_outc = np.transpose(weights_t.cpu().detach().numpy(), (2, 3, 1, 0)) # kH, kW, InC, OutC
-                        np_relevance_ohw_outc = np.transpose(current_relevance_np.squeeze(0), (1, 2, 0)) # OutH, OutW, OutC
-                        np_bias_outc = bias_t.cpu().detach().numpy() # OutC
-
-                        # Convert to PyTorch tensors for the CUDA function
-                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        dtype = torch.float32
-
-                        torch_input_ihwc = torch.as_tensor(np_input_act_hwc, device=device, dtype=dtype)
-                        torch_kernel_khw_inc_outc = torch.as_tensor(np_kernel_khw_inc_outc, device=device, dtype=dtype)
-                        torch_bias_outc = torch.as_tensor(np_bias_outc, device=device, dtype=dtype)
-                        torch_relevance_ohw_outc = torch.as_tensor(np_relevance_ohw_outc, device=device, dtype=dtype)
-
-                        temp_wt_hwc_tensor = ActiveUP.calculate_wt_conv_pytorch_cuda(
-                            input_tensor_ihwc=torch_input_ihwc,
-                            kernel_filters_tensor_khw_inc_outc=torch_kernel_khw_inc_outc,
-                            kernel_bias_tensor_outc=torch_bias_outc,
-                            output_channel_gain_map_tensor_ohw_outc=torch_relevance_ohw_outc,
-                            strides_hw=stride_val_tuple,
-                            padding_mode_or_values=padding_config_for_cuda,
-                            activation_config=activation_conf
-                        )
-                        # Convert result back to NumPy for subsequent operations
-                        temp_wt_hwc = temp_wt_hwc_tensor.cpu().detach().numpy()
-                        temp_wt = np.transpose(temp_wt_hwc, (2,0,1))[np.newaxis, ...]
-
-                    else:
-                        temp_wt = ActiveUP.calculate_wt_conv(
-                            current_relevance_np,
-                            input_activation_np,
-                            weights_t,
-                            bias_t,
-                            padding_val,
-                            stride_val,
-                            activation_conf
-                        )
-                    if use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        pass
-                    elif not use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        temp_wt = temp_wt.cpu().detach().numpy()
-                    all_wt[child_nodes[0]] += temp_wt
-
-                elif model_resource[1][start_layer]["class"] == "MaxPool2d":
-                    padding_val = module_obj.padding
-                    stride_val = module_obj.stride
-                    kernel_size_val = module_obj.kernel_size
-                    
-                    if isinstance(kernel_size_val, int):
-                        kernel_size_val = (kernel_size_val, kernel_size_val)
-
-                    if use_refactored_handlers:
-                        # Ensure stride_val is a tuple for the CUDA function
-                        if isinstance(stride_val, int):
-                            stride_val_tuple = (stride_val, stride_val)
-                        else:
-                            stride_val_tuple = stride_val
-
-                        # Prepare inputs as NumPy arrays first for consistent transposition logic
-                        np_input_act_hwc = np.transpose(input_activation_np.squeeze(0), (1, 2, 0))
-                        np_relevance_ohw_outc = np.transpose(current_relevance_np.squeeze(0), (1, 2, 0))
-
-                        # Convert to PyTorch tensors for the CUDA function
-                        # Assuming float32 and current CUDA device
-                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        dtype = torch.float32
-
-                        torch_input_act_hwc = torch.as_tensor(np_input_act_hwc, device=device, dtype=dtype)
-                        torch_relevance_ohw_outc = torch.as_tensor(np_relevance_ohw_outc, device=device, dtype=dtype)
-
-                        temp_wt_hwc_tensor = ActiveUP.calculate_wt_maxpool_pytorch_cuda(
-                            torch_input_act_hwc,
-                            torch_relevance_ohw_outc,
-                            kernel_size_val,
-                            stride_val_tuple, # Pass the ensured tuple
-                            padding_val, # mode string or tuple/list
-                        )
-                        # Convert result back to NumPy for subsequent operations
-                        temp_wt_hwc = temp_wt_hwc_tensor.cpu().detach().numpy()
-                        temp_wt = np.transpose(temp_wt_hwc, (2,0,1))[np.newaxis, ...]
-                    else:
-                        temp_wt = ActiveUP.calculate_wt_maxpool(
-                            current_relevance_np,
-                            input_activation_np,
-                            kernel_size_val,
-                            padding_val,
-                            stride_val
-                        )
-                    if use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        pass
-                    elif not use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        temp_wt = temp_wt.cpu().detach().numpy()
-                    all_wt[child_nodes[0]] += temp_wt
-                    
-                elif model_resource[1][start_layer]["class"] == "Flatten":
-                    if use_refactored_handlers:
-                        # Ensure inputs are tensors for the refactored CUDA version
-                        current_relevance_t = torch.as_tensor(current_relevance_np, device='cuda' if torch.cuda.is_available() else 'cpu')
-                        input_activation_t = torch.as_tensor(input_activation_np, device='cuda' if torch.cuda.is_available() else 'cpu')
-                        temp_wt = ActiveUP.reshape_tensor_pytorch_cuda(
-                            current_relevance_t, 
-                            input_activation_t
-                        )
-                    else:
-                        temp_wt = ActiveUP.calculate_wt_rshp(
-                            current_relevance_np,
-                            input_activation_np
-                        )
-                    if use_refactored_handlers and isinstance(temp_wt, torch.Tensor):
-                        temp_wt = temp_wt.cpu().detach().numpy()
-                    all_wt[child_nodes[0]] += temp_wt
-                    
-                elif model_resource[1][start_layer]["class"] in ["ReLU", "Identity", "Softmax"]:
-                    all_wt[child_nodes[0]] += current_relevance_np
-                
+                input_activation_source = None
+                # Ensure child_nodes is not empty and exists for all_out access
+                if child_nodes and child_nodes[0] in all_out:
+                    input_activation_source = all_out[child_nodes[0]]
                 else:
-                    temp_wt = current_relevance_np
+                    # This case should ideally not happen if layer_stack and model_resource are consistent
+                    # Or if it's the very first layer (input layer placeholder like 'identity')
+                    if start_layer == layer_stack[-1] and model_resource[1][start_layer].get("type") == "input": # last in stack is input
+                         pass # No input activation to process for the placeholder input layer
+                    else:
+                        print(f"Warning: Could not find input activation for child of {start_layer}")
+                        continue # Skip this layer if input is missing
+
+                # Skip if input_activation_source is None (e.g. for the 'identity' input layer)
+                if input_activation_source is None and not (start_layer == layer_stack[-1] and model_resource[1][start_layer].get("type") == "input"):
+                    continue
+
+                temp_wt = None # Initialize temp_wt
+
+                if use_refactored_handlers:
+                    current_relevance_t = torch.as_tensor(current_relevance, device=device, dtype=torch.float32) if isinstance(current_relevance, np.ndarray) else current_relevance.to(device=device, dtype=torch.float32)
+                    
+                    input_act_np = input_activation_source[0] if isinstance(input_activation_source, tuple) else input_activation_source
+                    input_activation_t = torch.as_tensor(input_act_np, device=device, dtype=torch.float32)
+                    
+                    layer_class = model_resource[1][start_layer]["class"]
+
+                    if layer_class == "Linear":
+                        temp_wt = ActiveUP.calculate_wt_fc_pytorch(
+                            current_relevance_t, input_activation_t,
+                            module_obj.weight.to(device), module_obj.bias.to(device),
+                            activation_conf, device=device
+                        )
+                    elif layer_class == "Conv2d":
+                        padding_val = module_obj.padding
+                        stride_val = module_obj.stride
+                        padding_for_v2 = padding_val
+                        if isinstance(padding_val, tuple) and len(padding_val) == 2:
+                            padding_for_v2 = (padding_val[1], padding_val[0])
+                        
+                        temp_wt = ActiveUP.calculate_wt_conv_pytorch(
+                            current_relevance_t, input_activation_t,
+                            module_obj.weight.to(device), module_obj.bias.to(device),
+                            padding_for_v2, stride_val, activation_conf
+                        )
+                    elif layer_class == "MaxPool2d":
+                        padding_val = module_obj.padding
+                        stride_val = module_obj.stride
+                        kernel_size_val = module_obj.kernel_size
+                        padding_for_v2 = padding_val
+                        if isinstance(padding_val, tuple) and len(padding_val) == 2:
+                            padding_for_v2 = (padding_val[1], padding_val[0])
+
+                        temp_wt = ActiveUP.calculate_wt_maxpool_pytorch(
+                            current_relevance_t, input_activation_t,
+                            kernel_size_val, padding_for_v2, stride_val
+                        )
+                    elif layer_class == "Flatten":
+                        temp_wt = ActiveUP.calculate_wt_rshp_pytorch(current_relevance_t, input_activation_t)
+                    elif layer_class in ["ReLU", "Identity", "Softmax"]:
+                        temp_wt = current_relevance_t
+                    else:
+                        temp_wt = current_relevance_t # Default pass-through
+                    
+                    if temp_wt is not None:
+                         all_wt[child_nodes[0]] = all_wt[child_nodes[0]].to(device, dtype=torch.float32) + temp_wt.to(device, dtype=torch.float32)
+
+                else: # Original NumPy path
+                    current_relevance_np = current_relevance.cpu().detach().numpy() if isinstance(current_relevance, torch.Tensor) else current_relevance
+                    input_act_np_for_handler = input_activation_source[0] if isinstance(input_activation_source, tuple) else input_activation_source
+                    layer_class = model_resource[1][start_layer]["class"]
+
+                    if layer_class == "Linear":
+                        temp_wt = ActiveUP.calculate_wt_fc(
+                            current_relevance_np, input_act_np_for_handler,
+                            module_obj.weight.cpu().detach().numpy(), module_obj.bias.cpu().detach().numpy(),
+                            activation_conf
+                        )
+                    elif layer_class == "Conv2d":
+                        temp_wt = ActiveUP.calculate_wt_conv(
+                            current_relevance_np, input_act_np_for_handler,
+                            module_obj.weight.cpu().detach().numpy(), module_obj.bias.cpu().detach().numpy(),
+                            module_obj.padding, module_obj.stride, activation_conf
+                        )
+                    elif layer_class == "MaxPool2d":
+                        temp_wt = ActiveUP.calculate_wt_maxpool(
+                            current_relevance_np, input_act_np_for_handler,
+                            module_obj.kernel_size, module_obj.padding, module_obj.stride
+                        )
+                    elif layer_class == "Flatten":
+                        temp_wt = ActiveUP.calculate_wt_rshp(current_relevance_np, input_act_np_for_handler)
+                    elif layer_class in ["ReLU", "Identity", "Softmax"]:
+                        temp_wt = current_relevance_np
+                    else:
+                        temp_wt = current_relevance_np # Default pass-through
+                    
+                    if temp_wt is not None:
+                        if isinstance(temp_wt, torch.Tensor): temp_wt = temp_wt.cpu().detach().numpy()
+                        # Ensure all_wt[child_nodes[0]] is also NumPy if it was initialized as tensor
+                        if isinstance(all_wt[child_nodes[0]], torch.Tensor):
+                             all_wt[child_nodes[0]] = all_wt[child_nodes[0]].cpu().detach().numpy()
                     all_wt[child_nodes[0]] += temp_wt
-        
+            elif start_layer == layer_stack[-1] and model_resource[1][start_layer].get("type") == "input": # Handle explicit input layer
+                pass # No relevance propagation from the 'identity' input layer itself.
+
         if max_unit > 0 and scaler == 0:
             temp_dict = {}
             for k_wt, v_wt in all_wt.items():
-                temp_dict[k_wt] = UP_ORIGINAL.weight_normalize(v_wt, max_val=max_unit)
+                v_wt_np = v_wt.cpu().detach().numpy() if isinstance(v_wt, torch.Tensor) else np.asarray(v_wt)
+                temp_dict[k_wt] = UP_ORIGINAL.weight_normalize(v_wt_np, max_val=max_unit)
             all_wt = temp_dict
         elif scaler > 0:
             temp_dict = {}
             for k_wt, v_wt in all_wt.items():
-                temp_dict[k_wt] = UP_ORIGINAL.weight_scaler(v_wt, scaler=scaler)
+                v_wt_np = v_wt.cpu().detach().numpy() if isinstance(v_wt, torch.Tensor) else np.asarray(v_wt)
+                temp_dict[k_wt] = UP_ORIGINAL.weight_scaler(v_wt_np, scaler=scaler)
             all_wt = temp_dict
+
+        if use_refactored_handlers:
+            final_all_wt_np = {}
+            for k, v_tensor_or_np in all_wt.items():
+                if isinstance(v_tensor_or_np, torch.Tensor):
+                    final_all_wt_np[k] = v_tensor_or_np.cpu().detach().numpy()
+                else: # Should already be numpy if it went through scaler/normalizer
+                    final_all_wt_np[k] = np.asarray(v_tensor_or_np) 
+            return final_all_wt_np
 
         return all_wt
 

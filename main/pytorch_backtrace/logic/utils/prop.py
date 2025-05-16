@@ -138,7 +138,7 @@ class LSTM_backtrace(object):
 
         self.compute_log = {}
 
-    def calculate_wt_fc(self, wts, inp, w, b, act):
+    def lstm_wt_ful_conn(self, wts, inp, w, b, act):
         mul_mat = np.einsum("ij,i->ij", w, inp).T
         wt_mat = np.zeros(mul_mat.shape)
         for i in range(mul_mat.shape[0]):
@@ -370,140 +370,162 @@ def dummy_wt(wts, inp, *args):
     test_wt = np.zeros_like(inp)
     return test_wt
 
-def calculate_wt_fc(wts, inp, w, b, activation_conf, task="classification"):
-    """Calculates the relevance weights for a fully connected layer.
-
-    Args:
-        wts: Relevance array for the output of the layer. Shape (J,) or (1,J).
-        inp: Input array to the layer. Shape (I,) or (1,I).
-        w: Weight tensor of the layer.
-        b: Bias tensor of the layer.
-        activation_conf: Configuration for the activation function.
-        task: Type of task, e.g., "classification".
-
-    Returns:
-        Relevance array for the input of the layer. Shape (I,).
+def calculate_wt_fc(wts, inp, w, b, act):
     """
-    # Convert PyTorch tensors to NumPy arrays, ensuring they are on CPU
-    w_np = w.cpu().detach().numpy() # Shape (J, I) - out_features, in_features
-    b_np = b.cpu().detach().numpy() # Shape (J,)
+    Optimized calculation of relevance propagation for a linear layer.
     
-    # Squeeze batch dimension if present (assuming batch size 1 for these calculations)
+    Parameters:
+    -----------
+    wts : numpy.ndarray
+        Weights for relevance calculation. Expected shape (O,) or (1,O).
+    inp : numpy.ndarray
+        Input values. Expected shape (I,) or (1,I).
+    w : numpy.ndarray
+        Weight tensor of the layer. Expected shape (O,I).
+    b : numpy.ndarray
+        Bias tensor of the layer. Expected shape (O,).
+    act : dict
+        Activation function details.
+        
+    Returns:
+    --------
+    numpy.ndarray
+        Weighted matrix for relevance propagation, shape (I,).
+    """
+    w_np = w # Should be (O,I) as per VGG model layers
+    b_np = b # Should be (O,)
+    
+    _wts = wts
+    if isinstance(_wts, np.ndarray) and _wts.ndim == 2 and _wts.shape[0] == 1:
+        _wts = _wts.squeeze(0) # Now shape (O,)
+    
     inp_np = inp
     if isinstance(inp_np, np.ndarray) and inp_np.ndim == 2 and inp_np.shape[0] == 1:
-        inp_np = inp_np.squeeze(0) # Shape (I,)
+        inp_np = inp_np.squeeze(0) # Now shape (I,)
+     
+    # Calculate contribution matrix: mul_mat[j,i] = w_np[j,i] * inp_np[i]
+    # w_np is (O,I), inp_np is (I,). Broadcasting inp_np to (1,I) gives mul_mat (O,I).
+    mul_mat = w_np * inp_np[np.newaxis, :] 
+     
+    # Pre-compute masks and values all at once
+    pos_mask = mul_mat > 0 # Shape (O,I)
+    neg_mask = mul_mat < 0 # Shape (O,I)
+     
+    # Use masks directly for efficient computation
+    p_mul_mat = np.where(pos_mask, mul_mat, 0)
+    n_mul_mat = np.where(neg_mask, -mul_mat, 0)  # Note the negation is applied here
+     
+    # Sum along axis=1 (sum over inputs i for each output j) for efficient reduction
+    # If mul_mat is (O,I), axis=1 sums over I, result is (O,)
+    p_sums = np.sum(p_mul_mat, axis=1) # Shape (O,)
+    n_sums = np.sum(n_mul_mat, axis=1) # Shape (O,)
+     
+    # Efficiently split bias
+    p_bias = np.maximum(b_np, 0) # Shape (O,)
+    n_bias = -np.minimum(b_np, 0) # Shape (O,)
+     
+    # Total sums
+    t_sums = p_sums + p_bias - n_sums - n_bias # Shape (O,)
+     
+    # Create aggregation weight arrays
+    p_agg_wts = np.zeros_like(p_sums) # Shape (O,)
+    n_agg_wts = np.zeros_like(n_sums) # Shape (O,)
+     
+    # Handle activation constraints - process only necessary elements
+    if act["type"] == "mono":
+        # Apply lower bound constraint if it exists
+        if act["range"]["l"]:
+            p_sums = np.where(t_sums < act["range"]["l"], 0, p_sums)
+            
+        # Apply upper bound constraint if it exists
+        if act["range"]["u"]:
+            n_sums = np.where(t_sums > act["range"]["u"], 0, n_sums)
+            
+    elif act["type"] == "non_mono":
+        func = act["func"]
+        
+        # Only compute where needed - identify where both p_sums and n_sums are positive
+        both_positive = (p_sums > 0) & (n_sums > 0)
+        if np.any(both_positive):
+            # Only vectorize and compute for necessary indices
+            indices = np.where(both_positive)[0]
+            
+            # Compute activations only for relevant indices
+            t_acts = np.zeros_like(t_sums)
+            p_acts = np.zeros_like(p_sums)
+            n_acts = np.zeros_like(n_sums)
+            
+            # Apply vectorized function only where needed
+            vfunc = np.vectorize(func)
+            t_acts[indices] = vfunc(t_sums[indices])
+            p_acts[indices] = vfunc(p_sums[indices] + p_bias[indices])
+            n_acts[indices] = vfunc(-1 * (n_sums[indices] + n_bias[indices]))
+            
+            # Apply equality conditions efficiently
+            p_sums[indices] = np.where(t_acts[indices] == n_acts[indices], 0, p_sums[indices])
+            n_sums[indices] = np.where(t_acts[indices] == p_acts[indices], 0, n_sums[indices])
+        
+        # Apply range constraints directly
+        if act["range"]["l"]:
+            p_sums = np.where(t_sums < act["range"]["l"], 0, p_sums)
+            
+        if act["range"]["u"]:
+            n_sums = np.where(t_sums > act["range"]["u"], 0, n_sums)
     
-    wts_squeezed = wts
-    if isinstance(wts_squeezed, np.ndarray) and wts_squeezed.ndim == 2 and wts_squeezed.shape[0] == 1:
-        wts_squeezed = wts_squeezed.squeeze(0) # Shape (J,)
-
-    if not isinstance(wts_squeezed, np.ndarray):
-        wts_squeezed = np.array(wts_squeezed)
-    if not isinstance(inp_np, np.ndarray):
-        inp_np = np.array(inp_np)
-
-    # Ensure inp_np is 1D for the following operations if it started as (1,I)
-    if inp_np.ndim > 1:
-      inp_np = inp_np.flatten() # Should be (I,)
-
-    if activation_conf["name"] == "linear":
-        mul_val = activation_conf["params"]["mul_val"]
-        const_val = activation_conf["params"]["const_val"]
-        add_val = activation_conf["params"]["add_val"]
-        inp_new = (inp_np * mul_val) + const_val # (I,)
-        # w_np is (J,I). inp_new is (I,). temp_mul_mat[j,i] = w_np[j,i] * inp_new[i]
-        temp_mul_mat = w_np * inp_new # Broadcasts inp_new to (J,I)
-        num_ = wts_squeezed # (J,)
-        # den_[j] = sum_i(temp_mul_mat[j,i]) + add_val + b_np[j]
-        den_ = np.nansum(temp_mul_mat, axis=1) + add_val + b_np + 1e-9 # sum over I -> (J,)
-        div_val = num_ / den_ # (J,)
-        # result_mat[j,i] = temp_mul_mat[j,i] * div_val[j]
-        result_mat = np.einsum("ji,j->ji", temp_mul_mat, div_val) # temp_mul_mat is (J,I), div_val is (J,)
-        result_ = np.nansum(result_mat, axis=0) # sum over J -> (I,)
-        return result_
-    elif activation_conf["name"] == "relu":
-        mul_val = activation_conf["params"]["mul_val"]
-        const_val = activation_conf["params"]["const_val"]
-        add_val = activation_conf["params"]["add_val"]
-        inp_new = (inp_np * mul_val) + const_val # (I,)
-        temp_mul_mat = w_np * inp_new # (J,I)
-        mul_mat_ = np.maximum(0, temp_mul_mat) # (J,I)
-        num_ = wts_squeezed # (J,)
-        # den_[j] = sum_i(mul_mat_[j,i]) + (b_np[j])^+ + add_val
-        den_ = np.nansum(mul_mat_, axis=1) + np.maximum(0, b_np) + add_val + 1e-9 # sum over I -> (J,)
-        div_val = num_ / den_ # (J,)
-        # The einsum was ("ij,i->ij", mul_mat_, div_val). If mul_mat_ (J,I), div_val (J,). i=J, j=I.
-        # result_mat[idx_J, idx_I] = mul_mat_[idx_J, idx_I] * div_val[idx_J]
-        # This means mul_mat_ (J,I) and div_val (J,). Output (J,I)
-        result_mat = np.einsum("ji,j->ji", mul_mat_, div_val) # mul_mat_ is (J,I), div_val is (J,). Output (J,I)
-        result_ = np.nansum(result_mat, axis=0) # sum over J -> (I,)
-        return result_
-    elif activation_conf["name"] == "leaky_relu":
-        mul_val = activation_conf["params"]["mul_val"]
-        const_val = activation_conf["params"]["const_val"]
-        add_val = activation_conf["params"]["add_val"]
-        alpha = activation_conf["params"]["alpha"]
-        inp_new = (inp_np * mul_val) + const_val # (I,)
-        temp_mul_mat = w_np * inp_new # (J,I)
-        mul_mat_pos = np.maximum(0, temp_mul_mat)
-        mul_mat_neg = np.minimum(0, temp_mul_mat) * alpha
-        mul_mat_ = mul_mat_pos + mul_mat_neg # (J,I)
-        b_pos = np.maximum(0, b_np)
-        b_neg = np.minimum(0, b_np) * alpha
-        b_ = b_pos + b_neg # (J,)
-        num_ = wts_squeezed # (J,)
-        den_ = np.nansum(mul_mat_, axis=1) + b_ + add_val + 1e-9 # sum over I -> (J,)
-        div_val = num_ / den_ # (J,)
-        result_mat = np.einsum("ji,j->ji", mul_mat_, div_val) # (J,I)
-        result_ = np.nansum(result_mat, axis=0) # sum over J -> (I,)
-        return result_
-    elif activation_conf["name"] == "sigmoid":
-        mul_val = activation_conf["params"]["mul_val"]
-        const_val = activation_conf["params"]["const_val"]
-        add_val = activation_conf["params"]["add_val"]
-        inp_new = (inp_np * mul_val) + const_val # (I,)
-        temp_mul_mat = w_np * inp_new # (J,I)
-        num_ = wts_squeezed # (J,)
-        # Original LRP rule for sigmoid might use z_beta or z+ rule, this is a simplification.
-        # Assuming a simple proportional distribution based on weighted inputs if not using specific LRP rules.
-        den_ = np.nansum(temp_mul_mat, axis=1) + b_np + add_val + 1e-9 # sum over I -> (J,)
-        div_val = num_ / den_ # (J,)
-        result_mat = np.einsum("ji,j->ji", temp_mul_mat, div_val) # (J,I)
-        result_ = np.nansum(result_mat, axis=0) # sum over J -> (I,)
-        return result_
-    elif activation_conf["name"] == "softmax": # Softmax LRP is complex, this is a simplification
-        mul_val = activation_conf["params"]["mul_val"]
-        const_val = activation_conf["params"]["const_val"]
-        add_val = activation_conf["params"]["add_val"]
-        inp_new = (inp_np * mul_val) + const_val # (I,)
-        temp_mul_mat = w_np * inp_new # (J,I)
-        num_ = wts_squeezed # (J,)
-        den_ = np.nansum(temp_mul_mat, axis=1) + b_np + add_val + 1e-9 # sum over I -> (J,)
-        div_val = num_ / den_ # (J,)
-        result_mat = np.einsum("ji,j->ji", temp_mul_mat, div_val) # (J,I)
-        result_ = np.nansum(result_mat, axis=0) # sum over J -> (I,)
-        return result_
-    elif activation_conf["name"] == "None" or activation_conf["name"] == "tanh": # LRP-0 / Epsilon
-        # R_i = sum_j ( (x_i w_ij) / (sum_k x_k w_kj + b_j) * R_j )
-        # x_i = inp_np[i]
-        # w_ij = w_np[j,i] (weight from input i to output j)
-        # R_j = wts_squeezed[j]
-        # z_j = sum_k (inp_np[k] * w_np[j,k]) + b_np[j]
-        z = np.dot(inp_np, w_np.T) + b_np # inp_np (I,) @ w_np.T (I,J) -> (J,). This is z_j.
-        z_stabilized = z + 1e-9 * np.sign(z) # Stabilize denominator
-        z_stabilized[z_stabilized == 0] = 1e-9 # Avoid division by zero if z was exactly 0
+    # Calculate denominators for all rows at once
+    denominators = p_sums + n_sums + p_bias + n_bias # Shape (O,)
+     
+    # Avoid division by zero in denominators
+    safe_denominators = np.where(denominators == 0, 1, denominators) # Reverted from 1e-9
+     
+    # Calculate aggregation weights in one operation
+    mask_p_positive = p_sums > 0
+    p_factor1 = (p_sums + p_bias) / safe_denominators
+    p_factor2 = np.where(p_sums + p_bias != 0,
+                         p_sums / (p_sums + p_bias), # Reverted from p_sums + p_bias + 1e-9
+                         0)
+    p_agg_wts = np.where(mask_p_positive, p_factor1 * p_factor2, 0) # Shape (O,)
+     
+    mask_n_positive = n_sums > 0
+    n_factor1 = (n_sums + n_bias) / safe_denominators
+    n_factor2 = np.where(n_sums + n_bias != 0,
+                         n_sums / (n_sums + n_bias), # Reverted from n_sums + n_bias + 1e-9
+                         0)
+    n_agg_wts = np.where(mask_n_positive, n_factor1 * n_factor2, 0) # Shape (O,)
+     
+    # Safe divisors for p_sums and n_sums
+    p_sums_safe = np.where(p_sums == 0, 1, p_sums) # Reverted from 1e-9
+    n_sums_safe = np.where(n_sums == 0, 1, n_sums) # Reverted from 1e-9
         
-        # relevance_terms_ji[j,i] = (inp_np[i] * w_np[j,i] / z_stabilized[j]) * wts_squeezed[j]
-        # This is (x_i * w_ij) * (R_j / z_j)
-        term1 = (w_np * inp_np) # Element-wise: term1[j,i] = w_np[j,i] * inp_np[i]. Shape (J,I)
-        term2 = wts_squeezed / z_stabilized # Element-wise: term2[j] = wts_squeezed[j] / z_stabilized[j]. Shape (J,)
+    # Prepare weights matrix
+    wt_mat = np.zeros_like(mul_mat) # Shape (O,I)
+     
+    # Pre-compute as much as possible outside the loop
+    # _wts is (O,), p_agg_wts is (O,). Result is (O,)
+    p_coeffs = _wts * p_agg_wts 
+    n_coeffs = _wts * n_agg_wts * -1.0
+     
+    # Loop iterates O times (number of output neurons)
+    for i in range(mul_mat.shape[0]):
+        # Process positive values - use pre-computed coefficients
+        pos_idx = pos_mask[i] # 1D boolean mask for inputs to output i, shape (I,)
+        if np.any(pos_idx):
+            # mul_mat[i, pos_idx] is 1D, (N_pos_inputs_for_output_i,)
+            # p_sums_safe[i] is scalar
+            # p_coeffs[i] is scalar
+            wt_mat[i, pos_idx] = mul_mat[i, pos_idx] / p_sums_safe[i] * p_coeffs[i]
         
-        # Propagate: relevance_input_i = sum_j ( term1[j,i] * term2[j] )
-        # This is sum_j ( w_np[j,i] * inp_np[i] * wts_squeezed[j] / z_stabilized[j] )
-        propagated_relevance = np.einsum('ji,j->i', term1, term2) # sum over j for each i
-        return propagated_relevance
-    else: # default pass through, ensure it's 1D if wts was (1,J)
-        return wts_squeezed
+        # Process negative values - use pre-computed coefficients
+        neg_idx = neg_mask[i] # 1D boolean mask for inputs to output i, shape (I,)
+        if np.any(neg_idx):
+            # mul_mat[i, neg_idx] is 1D, (N_neg_inputs_for_output_i,)
+            # n_sums_safe[i] is scalar
+            # n_coeffs[i] is scalar
+            wt_mat[i, neg_idx] = mul_mat[i, neg_idx] / n_sums_safe[i] * n_coeffs[i]
+     
+    # Final summation
+    # wt_mat is (O,I). Sum over O (axis 0) to get relevance for each input I. Result (I,)
+    return np.sum(wt_mat, axis=0)
 
 def calculate_wt_rshp(wts, inp=None):
     x = np.reshape(wts, inp.shape)
@@ -777,9 +799,38 @@ def calculate_wt_conv(wts, inp, w, b, padding_config, strides_config, act):
     else:
         raise TypeError(f"Input 'wts' must be a PyTorch Tensor or NumPy array, got {type(wts)}")
 
-    w_torch_tensor = w # Keep original torch tensor for conv_unit
-    b_torch_tensor = b # Keep original torch tensor for conv_unit
-    w_np_OICK = w.cpu().detach().numpy() # (C_out, C_in/g, kH, kW)
+    # Ensure w and b are PyTorch tensors for calculate_wt_conv_unit
+    # Determine device from one of the tensors if possible, else default to CPU
+    device = None
+    if isinstance(w, torch.Tensor):
+        device = w.device
+        w_torch_tensor = w
+    elif isinstance(w, np.ndarray):
+        w_torch_tensor = torch.as_tensor(w, dtype=torch.float32)
+        # device can't be inferred from numpy, will be on CPU by default
+    else:
+        raise TypeError(f"Kernel 'w' must be a PyTorch Tensor or NumPy array, got {type(w)}")
+
+    if isinstance(b, torch.Tensor):
+        device = b.device if device is None else device # Prioritize w's device
+        b_torch_tensor = b
+    elif isinstance(b, np.ndarray):
+        b_torch_tensor = torch.as_tensor(b, dtype=torch.float32)
+        # device can't be inferred from numpy, will be on CPU by default
+    else:
+        raise TypeError(f"Bias 'b' must be a PyTorch Tensor or NumPy array, got {type(b)}")
+    
+    # If device is still None (e.g. w and b were numpy), try to get from inp or wts if they were tensors
+    if device is None:
+        if isinstance(inp, torch.Tensor): device = inp.device
+        elif isinstance(wts, torch.Tensor): device = wts.device
+        else: device = torch.device('cpu') # Fallback to CPU
+    
+    # Ensure tensors are on the same determined device before passing to unit or converting to numpy
+    w_torch_tensor = w_torch_tensor.to(device)
+    b_torch_tensor = b_torch_tensor.to(device)
+
+    w_np_OICK = w_torch_tensor.cpu().detach().numpy() # (C_out, C_in/g, kH, kW)
 
     squeezed_inp_chw = inp_np_choncpu.squeeze(0) if inp_np_choncpu.ndim == 4 and inp_np_choncpu.shape[0] == 1 else inp_np_choncpu
     squeezed_wts_chow = wts_np_choncpu.squeeze(0) if wts_np_choncpu.ndim == 4 and wts_np_choncpu.shape[0] == 1 else wts_np_choncpu

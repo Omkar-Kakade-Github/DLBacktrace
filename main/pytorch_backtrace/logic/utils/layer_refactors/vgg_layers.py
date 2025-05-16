@@ -676,11 +676,11 @@ def calculate_wt_conv_pytorch_cuda(
 
         chunk_updates_np_khw_inc = calculate_conv_unit_contribution_pytorch_cuda_batched(
             patch_tensor_batch=patch_chunk,
-            kernel_filters_tensor=kernel_filters_tensor_khw_inc_outc,
-            kernel_bias_tensor=kernel_bias_tensor_outc,
+        kernel_filters_tensor=kernel_filters_tensor_khw_inc_outc,
+        kernel_bias_tensor=kernel_bias_tensor_outc,
             output_channel_gain_tensor_batch=gain_chunk,
-            activation_config=activation_config
-        )
+        activation_config=activation_config
+    )
         accumulated_updates_np_khw_inc[i:i+chunk_size] = chunk_updates_np_khw_inc
         del patch_chunk, gain_chunk, chunk_updates_np_khw_inc # Hint for GC
         if device.type == 'cuda':
@@ -783,7 +783,7 @@ def calculate_fc_input_relevance_pytorch_cuda(
     # Squeeze batch dimension from input_activations_t if it exists and is 1 (less common for FC input but good for consistency)
     if input_activations_t.ndim == 2 and input_activations_t.shape[0] == 1:
         input_activations_t = input_activations_t.squeeze(0)
-
+    
     # Now all inputs (output_relevance_t, etc.) are PyTorch tensors on the target_device and target_dtype.
     device = target_device # Use the determined target_device
     dtype = target_dtype  # Use the determined target_dtype
@@ -921,7 +921,7 @@ def calculate_fc_input_relevance_pytorch_cuda(
     p_agg_wt_b = p_agg_wt.unsqueeze(1)
     n_agg_wt_b = n_agg_wt.unsqueeze(1)
     # prop_denom_p and prop_denom_n were already modified to avoid zeros by replacing small values with 1.0
-    prop_denom_p_b = prop_denom_p.unsqueeze(1) 
+    prop_denom_p_b = prop_denom_p.unsqueeze(1)
     prop_denom_n_b = prop_denom_n.unsqueeze(1)
 
     # Calculate for positive contributions
